@@ -1,6 +1,7 @@
 #include <iostream>
 #include <omp.h>
 #include "utils.h"
+#include <chrono>
 
 int get_thread_group_size(int degree) {
     if (degree <= 4) return 4;          // 2^2 threads
@@ -13,7 +14,7 @@ int checkDevice() {
     int num_devices = omp_get_num_devices();
     int result = 0;
     if (num_devices > 0) {
-        #pragma omp target
+        #pragma omp target map (tofrom: result)
         {
             if (!omp_is_initial_device()) {
                 printf("OpenMP can handle offloaded to GPU successfully...\n");
@@ -40,4 +41,14 @@ int checkArgs(int argc, char* argv[]) {
         return -1;
     }
     return 1;
+}
+
+void printExecutionTime(
+    std::chrono::high_resolution_clock::time_point start_time, 
+    std::chrono::high_resolution_clock::time_point end_time,
+    char* process_name) {
+        
+    std::chrono::duration<double> duration = end_time - start_time;
+    std::cout << process_name << " process completed successfully in "
+        << (double)duration.count() << " seconds" << std::endl;
 }

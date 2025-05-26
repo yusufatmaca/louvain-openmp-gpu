@@ -1,17 +1,10 @@
 #ifndef CSR_GRAPH_H
 #define CSR_GRAPH_H
 
-#include <vector>
-#include <string>
+#include <iostream>
+#include <chrono>
 
-// Structure to represent an edge in the graph
-struct Edge {
-    int src;    // Source vertex (1-indexed in MTX)
-    int dst;    // Destination vertex (1-indexed in MTX)
-    int weight; // Edge weight
-};
-
-// Structure to represent a graph in CSR format
+// Structure to represent a graph in Compressed Sparse Row (CSR) format
 struct Graph {
     int* row_ptr;           // Row pointers (offsets)
     int* col_idx;           // Column indices
@@ -27,5 +20,9 @@ struct Graph {
 
 Graph constructGraph(const std::string& filename);
 void printGraphStats(const Graph& graph);
+void printExecutionTime(
+    std::chrono::high_resolution_clock::time_point start_time, 
+    std::chrono::high_resolution_clock::time_point end_time,
+    char* process_name);
 
 #endif

@@ -6,7 +6,6 @@
 #include <chrono>
 #include <iostream>
 
-
 // Function to read a graph from a MTX file
 Graph constructGraph(const std::string& filename) {
     Graph graph;
@@ -102,9 +101,7 @@ Graph constructGraph(const std::string& filename) {
     file.close();
 
     auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed_time = end_time - start_time;
-    std::cout << "Graph read in " << elapsed_time.count() << " seconds." << std::endl;
-    std::cout << "Graph construction process completed successfully!" << std::endl;
+    printExecutionTime(start_time, end_time, "Graph construction");
     std::cout << "---------------------------------------------------" << std::endl;
 
     printGraphStats(graph);

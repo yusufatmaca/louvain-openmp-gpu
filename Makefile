@@ -1,46 +1,43 @@
 CXX = clang++
-CXXFLAGS = -std=c++17 -Wall -O3 -fopenmp -fopenmp-targets=nvptx64-nvidia-cuda -Xopenmp-target=nvptx64-nvidia-cuda -march=sm_86
+CXXFLAGS = -std=c++17 -Wall -O3 -fopenmp -fopenmp-targets=nvptx64-nvidia-cuda -Xopenmp-target=nvptx64-nvidia-cuda -march=sm_86 -g
 LDFLAGS = -L/usr/local/cuda-12.9/lib64
 
-# Include directory
-INC_DIR = inc
-
-# Binary directory
+SRC_DIR = src
+INC_DIR = include
+OBJ_DIR = build
 BIN_DIR = bin
 
-# Source files
-SOURCES = main.cpp $(INC_DIR)/csr_graph.cpp $(INC_DIR)/modularity_optimization.cpp $(INC_DIR)/utils.cpp
+# List source files
+SRC_FILES = main.cpp $(SRC_DIR)/csr_graph.cpp $(SRC_DIR)/louvain.cpp $(SRC_DIR)/utils.cpp
 
-# Object files
-OBJECTS = $(SOURCES:.cpp=.o)
+# Create matching object file paths in build/
+OBJ_FILES = $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(notdir $(SRC_FILES)))
 
-# Target executable
+# Final binary
 TARGET = $(BIN_DIR)/louvain_openmp
 
 all: $(TARGET)
 
-# Rule to create the binary directory if it doesn't exist
+# Link the final binary
+$(TARGET): $(OBJ_FILES) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
+
+# Rule to build object files in build/ from .cpp in root or src/
+$(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -c $< -o $@
+
+# Ensure bin/ and build/ directories exist
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-# Link object files to create the executable in bin/
-$(TARGET): $(OBJECTS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
-
-# Rule for main.cpp
-main.o: main.cpp $(INC_DIR)/csr_graph.h $(INC_DIR)/modularity_optimization.h
-	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -c $< -o $@
-
-# Rule for csr_graph.cpp
-$(INC_DIR)/csr_graph.o: $(INC_DIR)/csr_graph.cpp $(INC_DIR)/csr_graph.h
-	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -c $< -o $@
-
-# Rule for modularity_optimization.cpp
-$(INC_DIR)/modularity_optimization.o: $(INC_DIR)/modularity_optimization.cpp $(INC_DIR)/modularity_optimization.h $(INC_DIR)/utils.h
-	$(CXX) $(CXXFLAGS) -I$(INC_DIR) -c $< -o $@
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
 
 clean:
-	rm -f $(TARGET) $(OBJECTS) *.csr
-	rm -rf $(BIN_DIR)
+	rm -rf $(OBJ_DIR)/*.o $(TARGET)
 
 .PHONY: all clean
+
