@@ -2,8 +2,8 @@ import pandas as pd
 from scipy.io import mmwrite
 from scipy.sparse import coo_matrix
 
-input_file = "wiki-Talk.txt.gz"
-output_file = "wiki-Talk.mtx"
+input_file = "com-youtube.ungraph.txt.gz"
+output_file = "com-youtube.ungraph.mtx"
 
 edges = pd.read_csv(
     input_file,

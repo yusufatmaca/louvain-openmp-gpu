@@ -6,6 +6,8 @@
 #include <limits.h>
 #include <cmath>
 
+#define MAX_HASH_SIZE 4096
+
 void parallel_prefix_sum(int* arr, int n) {
     // Simple sequential prefix sum on GPU
     // For better performance, use a more sophisticated parallel algorithm
@@ -20,7 +22,7 @@ void parallel_prefix_sum(int* arr, int n) {
 
 
 
-VertexSet* partition(int* vertex_strength, int num_vertices,
+VertexSet* partition(double* vertex_strength, int num_vertices,
                      int bucket_k, int* buckDSize) {
     int lower_bound = (bucket_k > 0) ? buckDSize[bucket_k - 1] : 0;
     int upper_bound = buckDSize[bucket_k];
@@ -30,7 +32,7 @@ VertexSet* partition(int* vertex_strength, int num_vertices,
     #pragma omp target teams distribute parallel for reduction(+:count) \
         map(to: vertex_strength[0:num_vertices], lower_bound, upper_bound, bucket_k)
     for (int i = 0; i < num_vertices; i++) {
-        int degree = vertex_strength[i];
+        double degree = vertex_strength[i];
         // Special case for first bucket to include degree 0 vertices
         if (bucket_k == 0) {
             if (degree >= lower_bound && degree <= upper_bound) {
@@ -100,225 +102,6 @@ VertexSet* partition(int* vertex_strength, int num_vertices,
     return vSet;
 }
 
-int nextPrime(int n) {
-    if (n <= 1) return 2;
-
-    bool found = false;
-    while (!found) {
-        found = true;
-        for (int i = 2; i * i <= n; i++) {
-            if (n % i == 0) {
-                found = false;
-                break;
-            }
-        }
-        if (!found) n++;
-    }
-    return n;
-}
-
-// Compare-and-swap operation for GPU (using OpenMP atomics)
-inline bool atomicCAS(int* address, int expected, int desired) {
-    int old_val;
-    #pragma omp critical
-    {
-        old_val = *address;
-        if (*address == expected) {
-            *address = desired;
-        }
-    }
-    return (old_val == expected);
-}
-
-
-// Double hashing function for collision resolution
-inline int doubleHash(int community_id, int iteration, int table_size) {
-    // First hash function
-    int h1 = community_id % table_size;
-    // Second hash function (must be coprime with table_size)
-    int h2 = 1 + (community_id % (table_size - 1));
-    // Combined hash with iteration
-    return (h1 + iteration * h2) % table_size;
-}
-
-void computeMoveParallel(int* vertices,         int num_vertices /*# num of vertices in the current bucket*/,
-                         Graph& graph,
-                         int* communities,      double* community_strength,
-                         int* vertex_strength,  double m,
-                         int* best_communities, double* best_gains,
-                         DebugInfo* debug_info) {
-
-    int count = 0;
-
-    #pragma omp target parallel for \
-            map(tofrom: \
-                vertices[0:num_vertices], \
-                num_vertices, \
-                communities[0:graph.num_vertices], \
-                community_strength[0:graph.num_vertices], \
-                vertex_strength[0:graph.num_vertices], \
-                graph.row_ptr[0:(graph.num_vertices + 1)], \
-                graph.col_idx[0:graph.num_edges], \
-                graph.values[0:graph.num_edges], m, \
-                best_communities[0:graph.num_vertices], \
-                best_gains[0:graph.num_vertices], \
-                debug_info[0:num_vertices])
-            /*map(to: vertices[0:num_vertices], \
-                    vertex_strength[0: num_vertices]) \ */
-        for (int idx = 0; idx < num_vertices; idx++) {
-            int vertex = vertices[idx]; // Get the vertex ID from the current bucket
-            int vertex_degree = vertex_strength[vertex];
-
-            int best_community = 0;
-            double best_gain = 0.0;
-
-            if (vertex_degree == 0) {
-                // Isolated vertex stays in its own community
-                best_community = communities[vertex];
-                best_gain = 0.0;
-            } else {
-            /*
-                #### From the paper:
-                     The size of the hash tables for `i` 
-                     is drawn from a list of precomputed prime numbers 
-                     as the smallest value larger than 1.5 times the degree of `i`.
-            */
-                int hash_size = nextPrime((int)(2 * vertex_degree) + 1);
-
-                // Allocate hash tables
-                int* hashComm = new int[hash_size];
-                double* hashWeight = new double[hash_size];
-
-                // Initialize hash tables (-1 represents `null`/`empty`)
-                for (int i = 0; i < hash_size; i++) {
-                    hashComm[i] = -1;
-                    hashWeight[i] = 0.0;
-                }
-
-                // Current community of the vertex
-                int current_comm = communities[vertex];
-                int k_i = vertex_strength[vertex]; // Vertex Strength
-
-                // Variables to track the best move
-                double max_gain = 0.0;
-                int target_community = current_comm;
-
-                // Terms that are constant for all community comparisons
-                double a_c_i = community_strength[current_comm] - k_i;  // a_{C(i)\{i}}
-                double second_denominator = (2.0 * m * m);
-
-                // Process all neighbors
-                for (int edge_idx = graph.row_ptr[vertex]; edge_idx < graph.row_ptr[vertex + 1]; edge_idx++) {
-                    int neighbor = graph.col_idx[edge_idx];
-                    double edge_weight = graph.values[edge_idx];
-                    int neighbor_comm = communities[neighbor];
-
-                    // Find position in hash table using double hashing
-                    int iteration = 0;
-                    int pos;
-                    bool found = false;
-
-                    while (iteration < hash_size) {
-                        pos = doubleHash(neighbor_comm, iteration, hash_size);
-
-                        if (hashComm[pos] == neighbor_comm) {
-                            // Community already in hash table - add weight
-                            #pragma omp atomic
-                            hashWeight[pos] += edge_weight;
-                            found = true;
-                            break;
-                        } else if (hashComm[pos] == -1) {
-                            // Empty slot - try to claim it
-                            if (atomicCAS(&hashComm[pos], -1, neighbor_comm)) {
-                                // Successfully claimed the slot
-                                #pragma omp atomic
-                                hashWeight[pos] += edge_weight;
-                                found = true;
-                                break;
-                            }
-                            // If CAS failed, another thread claimed it - continue searching
-                        }
-                        iteration++;
-                    }
-
-                    if (!found) {
-                        // Hash table full (shouldn't happen with proper sizing)
-                        printf("Warning: Hash table full for vertex %d\n", vertex);
-                    }
-                }
-
-
-                // Now evaluate modularity gain for each neighboring community
-                for (int i = 0; i < hash_size; i++) {
-                    if (hashComm[i] != -1) {
-                        int comm = hashComm[i];
-                        // Intra-community edge weight to new community (e_{i→C(j)})
-                        double e_i_to_c = hashWeight[i];
-
-                        // Calculate modularity gain using Equation (2)
-                        double gain;
-                        if (comm == current_comm) {
-                            // Moving to same community - no gain
-                            gain = 0.0;
-                        } else {
-                            // First term: (e_{i→C(j)} - e_{i→C(i)\{i}}) / m
-                            double e_i_to_current = 0.0;
-                            if (current_comm != vertex) {  // If not in singleton community
-                                // Find edges to current community (excluding self)
-                                for (int j = 0; j < hash_size; j++) {
-                                    if (hashComm[j] == current_comm) {
-                                        e_i_to_current = hashWeight[j];
-                                        break;
-                                    }
-                                }
-                            }
-
-                            double first_term = (e_i_to_c - e_i_to_current) / m;
-
-                            // Second term: k_i * (a_{C(i)\{i}} - a_{C(j)}) / (2m²)
-                            double a_c_j = community_strength[comm];
-                            /*`k_i` and `a_c_i` were pre-calculated outside the current loop (line 199-200)*/
-                            double second_term = k_i * (a_c_i - a_c_j) / second_denominator;
-
-                            gain = first_term + second_term;
-                        }
-
-                        // Track best move
-                        if (gain > max_gain || (gain == max_gain && comm < target_community)) {
-                            max_gain = gain;
-                            target_community = comm;
-                        }
-                    }
-                }
-
-                // Clean up hash tables
-                delete[] hashComm;
-                delete[] hashWeight;
-
-                // Return results
-                best_community = target_community;
-                best_gain = max_gain;
-            }
-            
-            // Assign outputs (unchanged)
-            best_communities[vertex] = best_community;
-            best_gains[vertex] = best_gain;
-            /*
-            communities[vertex] = best_community;
-            community_strength[vertex] = vertex_strength[vertex];
-            */
-           
-           debug_info[idx].vertex_id = vertex;
-           debug_info[idx].old_community = communities[vertex];
-           debug_info[idx].new_community = best_community;
-           debug_info[idx].gain = best_gain;
-        }
-}
-
-/*
-    This function calculates the bucket boundaries for the given graph based on the degree distribution.
-    The degree distribution is divided into `numDBuckets` buckets, and the boundaries are stored in `bucDSize`.
-    */
 void calculateBucketBoundaries(Graph& graph, int numDBuckets, int* bucDSize) {
     int max_degree = graph.max_degree;
     int min_degree = graph.min_degree;
@@ -373,6 +156,212 @@ void calculateBucketBoundaries(Graph& graph, int numDBuckets, int* bucDSize) {
 
 }
 
+int nextPrime(int n) {
+    if (n <= 1) return 2;
+
+    bool found = false;
+    while (!found) {
+        found = true;
+        for (int i = 2; i * i <= n; i++) {
+            if (n % i == 0) {
+                found = false;
+                break;
+            }
+        }
+        if (!found) n++;
+    }
+    return n;
+}
+
+// Compare-and-swap operation for GPU (using OpenMP atomics)
+inline bool atomicCAS(int* address, int expected, int desired) {
+    int old_val;
+    #pragma omp critical
+    {
+        old_val = *address;
+        if (*address == expected) {
+            *address = desired;
+        }
+    }
+    return (old_val == expected);
+}
+
+
+// Double hashing function for collision resolution
+inline int doubleHash(int community_id, int iteration, int table_size) {
+    // First hash function
+    int h1 = community_id % table_size;
+    // Second hash function (must be coprime with table_size)
+    int h2 = 1 + (community_id % (table_size - 1));
+    // Combined hash with iteration
+    return (h1 + iteration * h2) % table_size;
+}
+
+// computeMove function needs to be inlined or its contents moved to computeMoveParallel
+// to avoid host allocations on the device.
+// We are moving the content of computeMove into computeMoveParallel directly.
+
+void computeMoveParallel(int* vertices, int num_vertices_in_bucket,
+                        Graph& graph,
+                        int* communities,
+                        double* community_strength,
+                        double* vertex_strength,
+                        ComputeMove* compute_moves, double m) {
+    
+    int* all_hashComm = new int[num_vertices_in_bucket * MAX_HASH_SIZE];
+    double* all_hashWeight = new double[num_vertices_in_bucket * MAX_HASH_SIZE];
+    
+    // Initialize to -1 and 0.0 on host (optional, can be done on device)
+    std::fill(all_hashComm, all_hashComm + num_vertices_in_bucket * MAX_HASH_SIZE, -1);
+    std::fill(all_hashWeight, all_hashWeight + num_vertices_in_bucket * MAX_HASH_SIZE, 0.0);
+
+    #pragma omp target teams distribute parallel for \
+        map(to: \
+            vertices[0:num_vertices_in_bucket], \
+            num_vertices_in_bucket, \
+            graph.row_ptr[0:(graph.num_vertices + 1)], \
+            graph.col_idx[0:graph.num_edges], \
+            graph.values[0:graph.num_edges]) \
+            communities[0:graph.num_vertices], \
+            community_strength[0:graph.num_vertices], \
+            vertex_strength[0:graph.num_vertices], m, \
+            all_hashComm[0:num_vertices_in_bucket * MAX_HASH_SIZE], \
+            all_hashWeight[0:num_vertices_in_bucket * MAX_HASH_SIZE]) \
+        map(tofrom: compute_moves[0:num_vertices_in_bucket])
+    for (int idx = 0; idx < num_vertices_in_bucket; idx++) {
+        int vertex = vertices[idx];
+
+        int* hashComm = &all_hashComm[idx * MAX_HASH_SIZE];
+        double* hashWeight = &all_hashWeight[idx * MAX_HASH_SIZE];
+
+        // --- Start of computeMove logic (now inlined) ---
+        // Get current community and vertex strength
+        int current_community = communities[vertex];
+        double k_i = (double)vertex_strength[vertex];  // Cast to double for calculations
+
+        // Initialize outputs (local to each thread/iteration)
+        int local_best_community = current_community;  // Default: stay in current community
+        double local_best_gain = 0.0;
+
+        compute_moves[idx].vertex_id = vertex;
+        compute_moves[idx].old_community = current_community;
+        compute_moves[idx].new_community = current_community;
+        compute_moves[idx].gain = 0.0;
+        
+        // If isolated vertex, no move needed
+        if (k_i == 0) {
+            continue; // Move to the next vertex
+        }
+
+        int degree = (int)(k_i / 2.0);  // Approximate degree
+        int desired_hash_size = nextPrime((int)(1.5 * degree) + 1);
+        int hash_size = (desired_hash_size < MAX_HASH_SIZE) ? desired_hash_size : MAX_HASH_SIZE;
+
+        // Initialize hash tables (-1 represents empty slot)
+        for (int i = 0; i < hash_size; i++) {
+            hashComm[i] = -1;
+            hashWeight[i] = 0.0;
+        }
+
+        // Step 1: Build hash table of neighboring communities and their edge weights
+        for (int edge_idx = graph.row_ptr[vertex]; edge_idx < graph.row_ptr[vertex + 1]; edge_idx++) {
+            int neighbor = graph.col_idx[edge_idx];
+            double edge_weight = (double)graph.values[edge_idx];  // Ensure double precision
+            int neighbor_community = communities[neighbor];
+
+            // Find position in hash table using double hashing
+            int iteration = 0;
+            int pos;
+            bool found = false;
+
+            while (iteration < hash_size) {
+                pos = doubleHash(neighbor_community, iteration, hash_size);
+
+                if (hashComm[pos] == neighbor_community) {
+                    // Community already in hash table - add weight
+                    hashWeight[pos] += edge_weight;
+                    found = true;
+                    break;
+                } else if (hashComm[pos] == -1) {
+                    // Empty slot - try to claim it
+                    // No need for atomicCAS here, as hashComm is private to this thread
+                    hashComm[pos] = neighbor_community;
+                    hashWeight[pos] += edge_weight;
+                    found = true;
+                    break;
+                }
+                iteration++;
+            }
+            if (!found) {
+                // This means the hash table is effectively "full" or has a bad collision pattern.
+                // Could indicate nextPrime isn't picking good primes, or hash_size is too small.
+                // For simplicity, we'll continue, but a robust solution might resize or use a different strategy.
+                printf("Warning: Hash table full for vertex %d, neighbor_comm %d\n", vertex, neighbor_community);
+            }
+        }
+
+        // Step 2: Calculate modularity gain for each neighboring community
+
+        // Pre-calculate terms used in Equation 2
+        double a_c_i = community_strength[current_community] - k_i;  // a_{C(i)\{i}}
+
+        // Track best move
+        double max_gain = 0.0;
+        int target_community = current_community;
+
+        // Find edge weight to current community (for e_{i→C(i)\{i}})
+        double e_i_to_current = 0.0;
+        for (int i = 0; i < hash_size; i++) {
+            if (hashComm[i] == current_community) {
+                e_i_to_current = hashWeight[i];
+                break;
+            }
+        }
+
+        // Evaluate each neighboring community
+        for (int i = 0; i < hash_size; i++) {
+            if (hashComm[i] != -1) { // Only process filled slots
+                int comm = hashComm[i];
+                double e_i_to_c = hashWeight[i];  // Edge weight from vertex to this community
+
+                // Calculate modularity gain using Equation 2 from the paper
+                // ΔQ = [e_{i→C} - e_{i→C(i)\{i}}] / m - k_i * [a_{C(i)\{i}} - a_C] / (2m²)
+                double gain;
+                if (comm == current_community) {
+                    gain = 0.0; // Moving to same community has no gain
+                } else {
+                    double first_term = (e_i_to_c - e_i_to_current) / m;
+
+                    double a_c = community_strength[comm];
+                    double second_term = (k_i * (a_c_i - a_c)) / (2.0 * m * m); // Use 2.0 * m * m from global scope
+
+                    gain = first_term + second_term;
+                }
+
+                // Update best move if this is better
+                // Tie-breaking: prefer lower community ID (as per paper)
+                if (gain > max_gain) {
+                    max_gain = gain;
+                    target_community = comm;
+                } else if (gain == max_gain && comm < target_community) {
+                    target_community = comm;
+                }
+            }
+        }
+
+        // Step 3: Store the best move for this vertex
+        compute_moves[idx].new_community = target_community;
+        compute_moves[idx].gain = max_gain;
+        // --- End of computeMove logic ---
+
+        // Clean up per-thread hash tables
+    delete[] all_hashComm;
+    delete[] all_hashWeight;
+
+
+    }
+}
+
 
 double modularity_optimization(Graph& graph) {
     /*
@@ -399,29 +388,22 @@ double modularity_optimization(Graph& graph) {
     */
 
     graph.total_edge_weight     = 0;                                // Total Edge Weight (for *unweighted* graph) := $m = |E|$
-    double m                    = 0;                                // Total Edge Weight := $m = \sum_{e \in E} w_e$
+    double m                    = 0.0;                                // Total Edge Weight := $m = \sum_{e \in E} w_e$
 
     double threshold_value      =   1e-6;                           // Threshold for convergence (fixed)
     double total_modularity_gain = 0.0;                             // Total Modularity Gain
     double modularity_gain      =   threshold_value + 1;            // Ensure we enter the loop
-    double constant_term        =   1.0 / (2.0 * m);
+    // double constant_term        =   1.0 / (2.0 * m); // This term depends on m, so it should be calculated after m is finalized
 
-    int* vertex_strength        = new int[num_vertices]();          // `vertex_strength` = $k_i$
-
-    int* best_communities       = new int[num_vertices]();
-    double* best_gains          = new double[num_vertices]();
-
+    double* vertex_strength        = new double[num_vertices]();          // `vertex_strength` = $k_i$
 
     // Offload related datas to GPU
-    #pragma omp target data                                                                             \
-            map(to:                                                                                     \
-                    graph.row_ptr[0:(num_vertices + 1)],                                                \
-                    graph.col_idx[0:graph.num_edges],                                                   \
-                    graph.values[0:graph.num_edges])                                                    \
-            map(tofrom:                                                                                 \
-                    vertex_strength[0:num_vertices], m, max_degree, min_degree, \
-                    communities[0:num_vertices], community_strength[0:num_vertices], modularity_gain,   \
-                    best_communities[0:num_vertices], best_gains[0:num_vertices])
+    #pragma omp target data \
+        map(to: graph.row_ptr[0:(num_vertices + 1)], \
+                graph.col_idx[0:graph.num_edges], \
+                graph.values[0:graph.num_edges]) \
+        map(tofrom: vertex_strength[0:num_vertices], m, max_degree, min_degree, \
+                    communities[0:num_vertices], community_strength[0:num_vertices])
     {
 
         // Calculate vertex strengths
@@ -437,16 +419,19 @@ double modularity_optimization(Graph& graph) {
             // Update maximum through reduction - this happens automatically
             max_degree = (thread_local_strength > max_degree) ? thread_local_strength : max_degree;
             min_degree = (thread_local_strength < min_degree) ? thread_local_strength : min_degree;
-            m += thread_local_strength; // Update total edge weight
+            m += (double)thread_local_strength; // Update total edge weight
         }
 
         // Update host data
         #pragma omp target update from(m, max_degree, min_degree)
         graph.max_degree = max_degree;
         graph.min_degree = min_degree;
-        graph.total_edge_weight = m/2;                  // For unweighted graphs, total edge weight is half the sum of vertex strengths
-        
-        std::cout << "Total edge weight (m): " << graph.total_edge_weight << std::endl;
+        graph.total_edge_weight = m / 2.0;                  // For unweighted graphs, total edge weight is half the sum of vertex strengths
+        m /= 2.0; // Correct m for modularity gain calculation
+
+        std::cout << "Total edge weight (graph.total_edge_weight): " << graph.total_edge_weight << std::endl;
+        std::cout << "Total edge weight (m): " << m << std::endl;
+
         std::cout << "Maximum degree: " << max_degree << std::endl;
         std::cout << "Minimum degree: " << min_degree << std::endl;
 
@@ -461,7 +446,7 @@ double modularity_optimization(Graph& graph) {
 
         #pragma omp target teams distribute parallel for
         for (int i = 0; i < num_vertices; i++) {
-            community_strength[i] = vertex_strength[i];
+            community_strength[i] = (double)vertex_strength[i];
         }
 
         const int numDBuckets = 10; // Statically assigned number of buckets
@@ -472,300 +457,132 @@ double modularity_optimization(Graph& graph) {
         */
         int* buckDSize = new int[numDBuckets + 1];
         calculateBucketBoundaries(graph, numDBuckets, buckDSize);
-        
+
         int iter = 0;
-        while (modularity_gain >= threshold_value) {
-            
+        while (modularity_gain >= threshold_value && iter < 100) { // Limit iterations to prevent infinite loops
+
             std::cout << "Iteration " << (iter + 1) << " started" << std::endl;
-            std::cout << "There are " << graph.num_vertices << " communities at the beginning of this iteration." << std::endl;
-            
+            // The number of communities might change, so it's not simply graph.num_vertices
+            // You'd need to count distinct communities after each iteration.
+            // std::cout << "There are " << graph.num_vertices << " communities at the beginning of this iteration." << std::endl;
+
             modularity_gain = 0.0;
-            
-            for (int k = 1; k <= numDBuckets; k++) {
+            int moves_made = 0;
+
+            for (int k = 0; k <= numDBuckets; k++) { // Loop through buckets, starting from 0
                 VertexSet* vSet = partition(vertex_strength, num_vertices, k, buckDSize);
-                std::cout << "There are " << vSet->size << " vertices in bucket: " << k << std::endl;
-                
+
                 if (vSet->size == 0) {
                     delete[] vSet->vertex_ids;
                     delete vSet;
                     continue;
                 }
-                
-                DebugInfo* debug_info = new DebugInfo[vSet->size];
 
+                ComputeMove* computeMove = new ComputeMove[vSet->size];
+
+                std::cout << "Processing bucket " << k << " with " << vSet->size << " vertices" << std::endl;
+
+                // Call the modified computeMoveParallel
                 computeMoveParallel(vSet->vertex_ids, vSet->size, graph,
-                    communities, community_strength, vertex_strength,
-                    m, best_communities, best_gains, debug_info);
-                   
-                // Update communities in parallel (lines 8-9 of Algorithm 1)
+                                   communities, community_strength, vertex_strength,
+                                   computeMove, m);
+
+                #pragma omp target update from(computeMove[0:vSet->size])
+                // Process the computed moves to find the best community for each vertex
+                for (int idx = 0; idx < vSet->size; idx++) {
+                    std::cout << "Vertex " << computeMove[idx].vertex_id
+                              << " old community: " << computeMove[idx].old_community
+                              << ", new community: " << computeMove[idx].new_community
+                              << ", gain: " << computeMove[idx].gain << std::endl;
+                }
+                delete[] computeMove;
+            }
+
+/*
+                double bucket_gain = 0.0;
+                int bucket_moves = 0;
+
+                // Accumulate modularity gain and apply moves
+                for (int idx = 0; idx < vSet->size; idx++) {
+                    int vertex = vSet->vertex_ids[idx];
+
+                    // Check if vertex is actually moving
+                    if (communities[vertex] != best_communities[vertex]) {
+                        bucket_moves++;
+                        bucket_gain += best_gains[vertex];
+
+                        // Debug output for first few moves
+                        if (moves_made < 5) {
+                            std::cout << "  Vertex " << vertex << " moves from community "
+                                     << communities[vertex] << " to " << best_communities[vertex]
+                                     << " with gain " << best_gains[vertex] << std::endl;
+                        }
+                    }
+                }
+
+                modularity_gain += bucket_gain;
+                moves_made += bucket_moves;
+
+                std::cout << "  Bucket " << k << ": " << bucket_moves << " moves, gain = "
+                         << bucket_gain << std::endl;
+
+                // Line 8-9 of Algorithm 1: Update communities
+                // This update must happen *after* processing all vertices in the bucket
+                // and *before* the next bucket or re-calculating community strengths.
+                // Since best_communities is already updated from device,
+                // now transfer it back to the 'communities' array on the device.
+
                 #pragma omp target teams distribute parallel for \
-                    map(to: vSet->vertex_ids[0:vSet->size], best_communities[0:num_vertices]) \
-                    map(tofrom: communities[0:num_vertices]) \
-                    map(tofrom: modularity_gain)
+                    map(to: vSet->vertex_ids[0:vSet->size], \
+                            best_communities[0:num_vertices]) \
+                    map(tofrom: communities[0:num_vertices])
                 for (int idx = 0; idx < vSet->size; idx++) {
                     int vertex = vSet->vertex_ids[idx];
                     communities[vertex] = best_communities[vertex];
-                    #pragma omp atomic
-                    modularity_gain += best_gains[vertex];
                 }
-
-                delete[] debug_info;
                 delete[] vSet->vertex_ids;
                 delete vSet;
             }
-
+            
+            // Implementation of Algorithm 1, lines 10-11:
+            // Re-compute community_strength for all communities
+            // First, reset all community strengths to 0 on the device
             #pragma omp target teams distribute parallel for
-            for (int c = 0; c < num_vertices; c++) {
-                community_strength[c] = 0.0;
+            for (int i = 0; i < num_vertices; i++) {
+                community_strength[i] = 0.0;
             }
-
-            // Then sum up vertex strengths for each community
+            
+            // Then, aggregate vertex strengths into their respective communities on the device
             #pragma omp target teams distribute parallel for
             for (int v = 0; v < num_vertices; v++) {
                 int comm = communities[v];
-                #pragma omp atomic
-                community_strength[comm] += vertex_strength[v];
+                // Using atomic update since multiple vertices might belong to the same community
+                // and try to update its strength concurrently.
+                #pragma omp atomic update
+                community_strength[comm] += (double)vertex_strength[v];
             }
-
-            #pragma omp target update from(modularity_gain)
+            
+            
             total_modularity_gain += modularity_gain;
             
-            std::cout << "Iteration " << (iter + 1) << " completed." << std::endl;
-            std::cout << "Modularity gain in this iteration: " << modularity_gain << std::endl;
-            std::cout << "Total modularity gain so far: " << total_modularity_gain << std::endl;
-            
+            std::cout << "Iteration " << (iter + 1) << " completed" << std::endl;
+            std::cout << "Total moves in this iteration: " << moves_made << std::endl;
+            std::cout << "Modularity gain for this iteration: " << modularity_gain << std::endl;
+            std::cout << "Total cumulative gain: " << total_modularity_gain << std::endl;
+            */
+
             iter++;
         }
         delete[] buckDSize;
-        
+
     }
 
     delete[] communities;
     delete[] community_strength;
     delete[] vertex_strength;
-    delete[] best_communities;
-    delete[] best_gains;
+
     return total_modularity_gain;
 }
-
-CondensedGraph* contract(Graph& graph, int* communities, int* vertex_strength) {
-    int num_vertices = graph.num_vertices;
-    
-    // Step 1: Initialize community size and degree arrays
-    int* comSize = new int[num_vertices]();
-    int* comDegree = new int[num_vertices]();
-    
-    #pragma omp target data \
-        map(to: communities[0:num_vertices], vertex_strength[0:num_vertices]) \
-        map(tofrom: comSize[0:num_vertices], comDegree[0:num_vertices])
-    {
-        // Initialize to zero
-        #pragma omp target teams distribute parallel for
-        for (int i = 0; i < num_vertices; i++) {
-            comSize[i] = 0;
-            comDegree[i] = 0;
-        }
-        
-        // Step 2: Count vertices and degrees per community (lines 4-6)
-        #pragma omp target teams distribute parallel for
-        for (int i = 0; i < num_vertices; i++) {
-            int c = communities[i];
-            #pragma omp atomic
-            comSize[c] += 1;
-            #pragma omp atomic
-            comDegree[c] += vertex_strength[i];
-        }
-    }
-    
-    // Step 3: Create new community IDs (lines 7-11)
-    int* newID = new int[num_vertices]();
-    
-    #pragma omp target data \
-        map(to: comSize[0:num_vertices]) \
-        map(tofrom: newID[0:num_vertices])
-    {
-        #pragma omp target teams distribute parallel for
-        for (int c = 0; c < num_vertices; c++) {
-            newID[c] = (comSize[c] == 0) ? 0 : 1;
-        }
-    }
-    
-    // Prefix sum to get new community IDs (line 12)
-    parallel_prefix_sum(newID, num_vertices);
-    
-    // Get the total number of communities
-    int num_communities;
-    #pragma omp target update from(newID[num_vertices-1])
-    num_communities = newID[num_vertices-1];
-    
-    // Step 4: Prepare for edge aggregation (lines 13-16)
-    int* edgePos = new int[num_vertices + 1]();
-    int* vertexStart = new int[num_vertices + 1]();
-    
-    #pragma omp target data \
-        map(to: comDegree[0:num_vertices], comSize[0:num_vertices]) \
-        map(from: edgePos[0:num_vertices+1], vertexStart[0:num_vertices+1])
-    {
-        // Copy community degrees to edgePos
-        #pragma omp target teams distribute parallel for
-        for (int i = 0; i < num_vertices; i++) {
-            edgePos[i] = comDegree[i];
-            vertexStart[i] = comSize[i];
-        }
-        edgePos[num_vertices] = 0;
-        vertexStart[num_vertices] = 0;
-    }
-    
-    // Prefix sum for edge positions and vertex starts
-    parallel_prefix_sum(edgePos, num_vertices + 1);
-    parallel_prefix_sum(vertexStart, num_vertices + 1);
-    
-    // Step 5: Assign vertices to communities (lines 17-19)
-    int* com = new int[num_vertices]();
-    
-    #pragma omp target data \
-        map(to: communities[0:num_vertices], vertexStart[0:num_vertices]) \
-        map(from: com[0:num_vertices])
-    {
-        #pragma omp target teams distribute parallel for
-        for (int i = 0; i < num_vertices; i++) {
-            int c = communities[i];
-            int res;
-            #pragma omp atomic capture
-            {
-                res = vertexStart[c];
-                vertexStart[c]++;
-            }
-            com[res] = i;
-        }
-    }
-    
-    // Step 6: Create the condensed graph structure
-    CondensedGraph* condensed = new CondensedGraph;
-    condensed->num_communities = num_communities;
-    condensed->community_map = newID;
-    
-    // Now we need to merge communities and create the new graph
-    // This part involves the bucket-based merging (lines 20-23)
-    
-    // Calculate bucket boundaries for communities
-    int* bucCSize = new int[11];  // Assuming numCBuckets = 10
-    
-    // Find max community degree
-    int max_com_degree = 0;
-    #pragma omp target teams distribute parallel for reduction(max: max_com_degree) \
-        map(to: comDegree[0:num_vertices])
-    for (int c = 0; c < num_vertices; c++) {
-        if (comDegree[c] > max_com_degree) {
-            max_com_degree = comDegree[c];
-        }
-    }
-    
-    // Simple linear bucketing for communities
-    for (int i = 0; i <= 10; i++) {
-        bucCSize[i] = (max_com_degree * i) / 10;
-    }
-    bucCSize[10] = max_com_degree + 1;
-    
-    // Step 7: Merge communities
-    // Note: The actual mergeCommunity function is complex and involves
-    // hash table operations similar to computeMoveParallel
-    // For brevity, I'll provide the structure here
-    
-    // Allocate space for new graph (this is an estimate)
-    int estimated_edges = graph.num_edges;
-    condensed->row_ptr = new int[num_communities + 1]();
-    condensed->col_idx = new int[estimated_edges];
-    condensed->values = new double[estimated_edges];
-    
-    // The actual merging would happen here using the bucket approach
-    // This involves complex hash table operations similar to computeMoveParallel
-    
-    // Clean up temporary arrays
-    delete[] comSize;
-    delete[] comDegree;
-    delete[] edgePos;
-    delete[] vertexStart;
-    delete[] com;
-    delete[] bucCSize;
-    
-    return condensed;
-}
-
-void mergeCommunity(int community_id, Graph& graph, int* communities,
-                   int* com, int com_start, int com_size,
-                   CondensedGraph* condensed, int* edge_offset) {
-    
-    // Estimate hash table size based on community degree
-    int estimated_neighbors = com_size * 10;  // Rough estimate
-    int hash_size = nextPrime((int)(1.5 * estimated_neighbors) + 1);
-    
-    // Allocate hash tables for neighbor communities and weights
-    int* hashComm = new int[hash_size];
-    double* hashWeight = new double[hash_size];
-    
-    // Initialize hash tables
-    for (int i = 0; i < hash_size; i++) {
-        hashComm[i] = -1;
-        hashWeight[i] = 0.0;
-    }
-    
-    // Process all vertices in this community
-    for (int idx = com_start; idx < com_start + com_size; idx++) {
-        int vertex = com[idx];
-        
-        // Process all edges of this vertex
-        for (int e = graph.row_ptr[vertex]; e < graph.row_ptr[vertex + 1]; e++) {
-            int neighbor = graph.col_idx[e];
-            double weight = graph.values[e];
-            int neighbor_comm = communities[neighbor];
-            
-            // Skip self-loops at community level
-            if (neighbor_comm == community_id) continue;
-            
-            // Insert into hash table using double hashing
-            int iteration = 0;
-            bool inserted = false;
-            
-            while (iteration < hash_size && !inserted) {
-                int pos = doubleHash(neighbor_comm, iteration, hash_size);
-                
-                if (hashComm[pos] == neighbor_comm) {
-                    #pragma omp atomic
-                    hashWeight[pos] += weight;
-                    inserted = true;
-                } else if (hashComm[pos] == -1) {
-                    if (atomicCAS(&hashComm[pos], -1, neighbor_comm)) {
-                        #pragma omp atomic
-                        hashWeight[pos] += weight;
-                        inserted = true;
-                    }
-                }
-                iteration++;
-            }
-        }
-    }
-    
-    // Extract edges from hash table and add to condensed graph
-    int edge_count = 0;
-    for (int i = 0; i < hash_size; i++) {
-        if (hashComm[i] != -1) {
-            int pos = (*edge_offset) + edge_count;
-            condensed->col_idx[pos] = hashComm[i];
-            condensed->values[pos] = hashWeight[i];
-            edge_count++;
-        }
-    }
-    
-    // Update edge offset
-    #pragma omp atomic
-    *edge_offset += edge_count;
-    
-    // Clean up
-    delete[] hashComm;
-    delete[] hashWeight;
-}
-
 
 /**
  * Perform modularity optimization on the graph
@@ -779,6 +596,6 @@ double louvain(Graph& graph) {
             - Modularity Optimization, and
             - Community Aggregation
     */
-    modularity_optimization(graph);
-    return 0.0;
+    double final_modularity = modularity_optimization(graph);
+    return final_modularity;
 }

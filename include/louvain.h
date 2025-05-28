@@ -1,4 +1,4 @@
-struct DebugInfo {
+struct ComputeMove {
     int vertex_id;
     int old_community;
     int new_community;
@@ -14,15 +14,8 @@ struct CommunityInfo {
     int edge_start;    // Starting position in edge array
 };
 
-// Structure for the condensed graph
-struct CondensedGraph {
-    int num_communities;
-    int num_edges;
-    int* row_ptr;
-    int* col_idx;
-    double* values;
-    int* community_map;  // Maps old community IDs to new vertex IDs
-};
+
+
 
 struct VertexSet {
     int* vertex_ids;    // Array of vertex IDs in this set
@@ -38,7 +31,9 @@ void calculateMaxDegree(int* row_ptr, int num_vertices, int* result);
 int calculateMinDegree(Graph& graph);
 void calculateBucketBoundaries(Graph& graph, int numDBuckets, int* bucDSize);
 int nextPrime(int n);
-void computeMoveParallel(int* vertices,         int num_vertices,   Graph& graph,
-                         int* communities,      double* community_strength,
-                         int* vertex_strength,  double m,
-                         int* best_communities, double* best_gains);
+void computeMoveParallel(int* vertices, int num_vertices_in_bucket,
+                        Graph& graph,
+                        int* communities,
+                        double* community_strength,
+                        double* vertex_strength,
+                        ComputeMove& compute_moves, double m);
